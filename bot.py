@@ -6,7 +6,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 # Токен берем из переменных окружения
-TOKEN = os.getenv("8967509509:AAEi7fPQxrKJaQhcIqLgsqoyXI-9EJKnWf4")
+TOKEN = os.getenv("BOT_TOKEN")
 # Render автоматически передает номер порта в переменную PORT
 PORT = int(os.getenv("PORT", 8080))
 
