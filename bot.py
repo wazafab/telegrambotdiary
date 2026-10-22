@@ -1,7 +1,7 @@
 import asyncio
 import os
 import aiosqlite
-from aiohttp import web, ClientSession
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -14,19 +14,23 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from google import genai
 
-TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("AQ.Ab8RN6IZphlNew9VLwAau4gBh54NR7M2FBiSOPKzSZohTAV4Ug")  # Ключ от Gemini API
+# Очищаем ключи от случайных пробелов или кавычек при копировании в Render
+TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 PORT = int(os.getenv("PORT", 8080))
 DB_PATH = "diary_bot.db"
 
-# Список моделей по приоритету (начиная с запрошенной 3.5 и заканчивая резервными рабочими)
+# Инициализируем клиент Gemini
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# Список легких и быстрых моделей (бот выберет первую доступную для вашего ключа)
 GEMINI_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
+    "gemini-2.5-flash",
+    "gemini-2.0-flash"
 ]
 
 bot = Bot(token=TOKEN)
@@ -262,10 +266,10 @@ DAYS_NAMES = {
 }
 
 
-# --- Запрос к Gemini API с автоматическим перебором легких моделей ---
+# --- Запрос к Gemini через официальную библиотеку google-genai ---
 async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
-    if not GEMINI_API_KEY:
-        return "⚠️ ԱԲ բանալին (GEMINI_API_KEY) կարգավորված չէ:"
+    if not ai_client:
+        return "⚠️ GEMINI_API_KEY բանալին ավելացված չէ Render-ի Environment Variables բաժնում:"
 
     class_key = f"{grade_num}-{grade_let}"
     class_schedule = SCHEDULE.get(class_key, {})
@@ -284,33 +288,24 @@ async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
         f"Պատասխանիր միայն հայերեն լեզվով և օգտագործիր էմոջիներ:"
     )
 
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
+    last_error = ""
+    for model_name in GEMINI_MODELS:
+        try:
+            response = await ai_client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            last_error = str(e)
+            print(f"[Gemini API] Ошибка с моделью {model_name}: {last_error}")
+            # Если ключ недействителен, не перебираем дальше
+            if "API_KEY_INVALID" in last_error or "API key not valid" in last_error:
+                return "⚠️ Սխալ GEMINI_API_KEY բանալի: Ստուգեք բանալին Google AI Studio-ում:"
+            continue
 
-    try:
-        async with ClientSession() as session:
-            for model_name in GEMINI_MODELS:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-                async with session.post(url, json=payload, timeout=12) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            return candidates[0]["content"]["parts"][0]["text"]
-                    else:
-                        err_text = await resp.text()
-                        print(f"[Gemini API] Модель {model_name} вернула статус {resp.status}: {err_text}")
-                        # Если ошибка в самом API-ключе (400 / 403), дальше модели можно не перебирать
-                        if resp.status in (400, 403) and "API_KEY_INVALID" in err_text:
-                            return "⚠️ Սխալ GEMINI_API_KEY բանալի:"
-                        continue
-            return "⚠️ ԱԲ-ն այս պահին անհասանելի է, փորձեք մի փոքր ուշ:"
-    except Exception as e:
-        print(f"[Gemini API Error]: {e}")
-        return "⚠️ Հնարավոր չեղավ կապ հաստատել ԱԲ-ի հետ:"
+    return f"⚠️ ԱԲ սխալ ({last_error[:80]}...)"
 
 
 # --- Состояния FSM (диалог выбора) ---
