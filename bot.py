@@ -16,12 +16,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("AQ.Ab8RN6IZphlNew9VLwAau4gBh54NR7M2FBiSOPKzSZohTAV4Ug") # Ключ от Gemini API
+GEMINI_API_KEY = os.getenv("AQ.Ab8RN6IZphlNew9VLwAau4gBh54NR7M2FBiSOPKzSZohTAV4Ug")  # Ключ от Gemini API
 PORT = int(os.getenv("PORT", 8080))
 DB_PATH = "diary_bot.db"
 
-# Используем быструю и легкую модель Gemini
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+# Список моделей по приоритету (начиная с запрошенной 3.5 и заканчивая резервными рабочими)
+GEMINI_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
+]
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -256,14 +262,11 @@ DAYS_NAMES = {
 }
 
 
-# --- Запрос к Gemini API через aiohttp (без лишних библиотек) ---
+# --- Запрос к Gemini API с автоматическим перебором легких моделей ---
 async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
     if not GEMINI_API_KEY:
         return "⚠️ ԱԲ բանալին (GEMINI_API_KEY) կարգավորված չէ:"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    
-    # Берем список предметов этого класса для контекста
     class_key = f"{grade_num}-{grade_let}"
     class_schedule = SCHEDULE.get(class_key, {})
     subjects = set()
@@ -289,13 +292,24 @@ async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
 
     try:
         async with ClientSession() as session:
-            async with session.post(url, json=payload, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    return "⚠️ ԱԲ-ն այս պահին զբաղված է, փորձեք մի փոքր ուշ:"
-    except Exception:
+            for model_name in GEMINI_MODELS:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+                async with session.post(url, json=payload, timeout=12) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            return candidates[0]["content"]["parts"][0]["text"]
+                    else:
+                        err_text = await resp.text()
+                        print(f"[Gemini API] Модель {model_name} вернула статус {resp.status}: {err_text}")
+                        # Если ошибка в самом API-ключе (400 / 403), дальше модели можно не перебирать
+                        if resp.status in (400, 403) and "API_KEY_INVALID" in err_text:
+                            return "⚠️ Սխալ GEMINI_API_KEY բանալի:"
+                        continue
+            return "⚠️ ԱԲ-ն այս պահին անհասանելի է, փորձեք մի փոքր ուշ:"
+    except Exception as e:
+        print(f"[Gemini API Error]: {e}")
         return "⚠️ Հնարավոր չեղավ կապ հաստատել ԱԲ-ի հետ:"
 
 
@@ -484,12 +498,11 @@ async def handle_ai_motivate(call: CallbackQuery, state: FSMContext):
     grade_num, grade_let = user_grade
     await call.answer("✨ ԱԲ-ն մտածում է...")
 
-    # Вызываем Gemini API
     ai_text = await get_ai_motivation(grade_num, grade_let)
 
     text = (
         f"🎓 Դասարան՝ {grade_num}-{grade_let}\n\n"
-        f"💡 **ԱԲ-ի խորհուրդը քեզ համար.**\n{ai_text}\n\n"
+        f"💡 ԱԲ-ի խորհուրդը քեզ համար.\n{ai_text}\n\n"
         "Ընտրեք շաբաթվա օրը դասացուցակը տեսնելու համար:"
     )
 
