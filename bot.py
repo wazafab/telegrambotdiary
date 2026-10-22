@@ -16,27 +16,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 from google import genai
 
-# Очищаем ключи от случайных пробелов или кавычек при копировании в Render
+# Очищаем переменные окружения от лишних пробелов или кавычек
 TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 PORT = int(os.getenv("PORT", 8080))
 DB_PATH = "diary_bot.db"
 
-# Инициализируем клиент Gemini
+# Инициализируем клиент Gemini и задаем модель gemini-3.5-flash-lite
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
-# Список легких и быстрых моделей (бот выберет первую доступную для вашего ключа)
-GEMINI_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash"
-]
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- Расписание разделено на каждый класс отдельно (1-Ա .. 9-Գ) ---
+# --- Расписание для каждого класса отдельно (1-Ա .. 9-Գ) ---
 SCHEDULE = {
     "1-Ա": {
         "monday": ["1. Այբբենարան", "2. Մաթեմատիկա", "3. Կերպարվեստ", "4. Ֆիզկուլտուրա"],
@@ -266,7 +259,7 @@ DAYS_NAMES = {
 }
 
 
-# --- Запрос к Gemini через официальную библиотеку google-genai ---
+# --- Запрос к Gemini (используется строго модель gemini-3.5-flash-lite) ---
 async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
     if not ai_client:
         return "⚠️ GEMINI_API_KEY բանալին ավելացված չէ Render-ի Environment Variables բաժնում:"
@@ -288,27 +281,21 @@ async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
         f"Պատասխանիր միայն հայերեն լեզվով և օգտագործիր էմոջիներ:"
     )
 
-    last_error = ""
-    for model_name in GEMINI_MODELS:
-        try:
-            response = await ai_client.aio.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            last_error = str(e)
-            print(f"[Gemini API] Ошибка с моделью {model_name}: {last_error}")
-            # Если ключ недействителен, не перебираем дальше
-            if "API_KEY_INVALID" in last_error or "API key not valid" in last_error:
-                return "⚠️ Սխալ GEMINI_API_KEY բանալի: Ստուգեք բանալին Google AI Studio-ում:"
-            continue
-
-    return f"⚠️ ԱԲ սխալ ({last_error[:80]}...)"
+    try:
+        response = await ai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        if response and response.text:
+            return response.text
+        return "⚠️ ԱԲ-ից դատարկ պատասխան ստացվեց:"
+    except Exception as e:
+        err_msg = str(e)
+        print(f"[Gemini API Error]: {err_msg}")
+        return f"⚠️ ԱԲ սխալ ({err_msg[:90]})"
 
 
-# --- Состояния FSM (диалог выбора) ---
+# --- Состояния FSM ---
 class SetupGrade(StatesGroup):
     grade_number = State()
     grade_letter = State()
