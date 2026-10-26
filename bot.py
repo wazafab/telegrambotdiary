@@ -1,7 +1,9 @@
 import asyncio
+import logging
 import os
-import aiosqlite
+import sys
 from aiohttp import web
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -16,20 +18,27 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 from google import genai
 
-# Очищаем переменные окружения от лишних пробелов или кавычек
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s"
+)
+logger = logging.getLogger("bot_diary")
+
+# Переменные окружения
 TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 PORT = int(os.getenv("PORT", 8080))
-DB_PATH = "diary_bot.db"
+DB_PATH = os.getenv("DB_PATH", "diary_bot.db")
 
-# Инициализируем клиент Gemini и задаем модель gemini-3.5-flash-lite
+# Клиент Gemini
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- Расписание для каждого класса отдельно (1-Ա .. 9-Գ) ---
+# --- Расписание (1-Ա .. 9-Գ) ---
 SCHEDULE = {
     "1-Ա": {
         "monday": ["1. Այբբենարան", "2. Մաթեմատիկա", "3. Կերպարվեստ", "4. Ֆիզկուլտուրա"],
@@ -259,10 +268,10 @@ DAYS_NAMES = {
 }
 
 
-# --- Запрос к Gemini (используется строго модель gemini-3.5-flash-lite) ---
+# --- Запрос к Gemini с ограничением по времени ---
 async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
     if not ai_client:
-        return "⚠️ GEMINI_API_KEY բանալին ավելացված չէ Render-ի Environment Variables բաժնում:"
+        return "⚠️ GEMINI_API_KEY բանալին ավելացված չէ Environment Variables բաժնում:"
 
     class_key = f"{grade_num}-{grade_let}"
     class_schedule = SCHEDULE.get(class_key, {})
@@ -282,17 +291,23 @@ async def get_ai_motivation(grade_num: int, grade_let: str) -> str:
     )
 
     try:
-        response = await ai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
+        # Лимит 15 секунд, чтобы не вешать процесс
+        response = await asyncio.wait_for(
+            ai_client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            ),
+            timeout=15.0
         )
         if response and response.text:
-            return response.text
+            return response.text.strip()
         return "⚠️ ԱԲ-ից դատարկ պատասխան ստացվեց:"
+    except asyncio.TimeoutError:
+        logger.error("Gemini API request timed out")
+        return "⚠️ Հարցումը չափազանց երկար տևեց: Խնդրում ենք փորձել կրկին:"
     except Exception as e:
-        err_msg = str(e)
-        print(f"[Gemini API Error]: {err_msg}")
-        return f"⚠️ ԱԲ սխալ ({err_msg[:90]})"
+        logger.error(f"Gemini API Error: {e}", exc_info=True)
+        return "⚠️ ԱԲ համակարգում տեղի ունեցավ սխալ: Խնդրում ենք փորձել մի փոքր ուշ:"
 
 
 # --- Состояния FSM ---
@@ -301,9 +316,10 @@ class SetupGrade(StatesGroup):
     grade_letter = State()
 
 
-# --- База данных SQLite ---
+# --- База данных SQLite с включенным WAL-режимом ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -314,20 +330,30 @@ async def init_db():
         await db.commit()
 
 async def get_user_grade(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT grade_number, grade_letter FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT grade_number, grade_letter FROM users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                return await cursor.fetchone()
+    except Exception as e:
+        logger.error(f"DB Error (get_user_grade): {e}")
+        return None
 
 async def save_user_grade(user_id: int, grade_number: int, grade_letter: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO users (user_id, grade_number, grade_letter)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                grade_number = excluded.grade_number,
-                grade_letter = excluded.grade_letter
-        """, (user_id, grade_number, grade_letter))
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO users (user_id, grade_number, grade_letter)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    grade_number = excluded.grade_number,
+                    grade_letter = excluded.grade_letter
+            """, (user_id, grade_number, grade_letter))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"DB Error (save_user_grade): {e}")
 
 
 # --- Клавиатуры ---
@@ -369,13 +395,13 @@ def get_days_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✨ Խորհուրդ ԱԲ-ից", callback_data="ai_motivate")
         ],
         [
-            InlineKeyboardButton(text="Փոխել դասարանը", callback_data="change_grade")
+            InlineKeyboardButton(text="⚙️ Փոխել դասարանը", callback_data="change_grade")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-# --- Обработчики команд и диалогов ---
+# --- Хэндлеры ---
 @dp.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext):
     user_grade = await get_user_grade(message.from_user.id)
@@ -406,11 +432,15 @@ async def handle_grade_num(call: CallbackQuery, state: FSMContext):
     grade_num = int(call.data.split(":")[1])
     await state.update_data(grade_number=grade_num)
     await state.set_state(SetupGrade.grade_letter)
-    await call.message.edit_text(
-        f"Ընտրված է՝ {grade_num}-րդ դասարան:\n"
-        "Այժմ ընտրեք դասարանի տառը (Ա, Բ, Գ):",
-        reply_markup=get_grade_letters_kb()
-    )
+    
+    try:
+        await call.message.edit_text(
+            f"Ընտրված է՝ {grade_num}-րդ դասարան:\n"
+            "Այժմ ընտրեք դասարանի տառը (Ա, Բ, Գ):",
+            reply_markup=get_grade_letters_kb()
+        )
+    except TelegramBadRequest:
+        pass
     await call.answer()
 
 @dp.callback_query(SetupGrade.grade_letter, F.data.startswith("grade_let:"))
@@ -422,11 +452,14 @@ async def handle_grade_let(call: CallbackQuery, state: FSMContext):
     await save_user_grade(call.from_user.id, grade_number, grade_letter)
     await state.clear()
     
-    await call.message.edit_text(
-        f"Կարգավորումները պահպանված են: Ձեր դասարանն է՝ {grade_number}-{grade_letter}:\n\n"
-        "Ընտրեք շաբաթվա օրը դասացուցակը դիտելու համար:",
-        reply_markup=get_days_kb()
-    )
+    try:
+        await call.message.edit_text(
+            f"Կարգավորումները պահպանված են: Ձեր դասարանն է՝ {grade_number}-{grade_letter}:\n\n"
+            "Ընտրեք շաբաթվա օրը դասացուցակը դիտելու համար:",
+            reply_markup=get_days_kb()
+        )
+    except TelegramBadRequest:
+        pass
     await call.answer()
 
 @dp.callback_query(F.data.startswith("day:"))
@@ -436,10 +469,13 @@ async def handle_day_selection(call: CallbackQuery, state: FSMContext):
     
     if not user_grade:
         await state.set_state(SetupGrade.grade_number)
-        await call.message.edit_text(
-            "Դասարանը ընտրված չէ: Խնդրում ենք ընտրել դասարանը:",
-            reply_markup=get_grade_numbers_kb()
-        )
+        try:
+            await call.message.edit_text(
+                "Դասարանը ընտրված չէ: Խնդրում ենք ընտրել դասարանը:",
+                reply_markup=get_grade_numbers_kb()
+            )
+        except TelegramBadRequest:
+            pass
         await call.answer()
         return
 
@@ -452,8 +488,8 @@ async def handle_day_selection(call: CallbackQuery, state: FSMContext):
     schedule_text = "\n".join(lessons)
 
     text = (
-        f"Դասարան՝ {grade_key}\n"
-        f"Օր՝ {day_title}\n\n"
+        f"📚 Դասարան՝ {grade_key}\n"
+        f"📅 Օր՝ {day_title}\n\n"
         f"Դասացուցակ՝\n{schedule_text}\n\n"
         "Ընտրեք այլ օր կամ փոխեք դասարանը:"
     )
@@ -470,10 +506,13 @@ async def handle_ai_motivate(call: CallbackQuery, state: FSMContext):
     
     if not user_grade:
         await state.set_state(SetupGrade.grade_number)
-        await call.message.edit_text(
-            "Դասարանը ընտրված չէ: Խնդրում ենք ընտրել դասարանը:",
-            reply_markup=get_grade_numbers_kb()
-        )
+        try:
+            await call.message.edit_text(
+                "Դասարանը ընտրված չէ: Խնդրում ենք ընտրել դասարանը:",
+                reply_markup=get_grade_numbers_kb()
+            )
+        except TelegramBadRequest:
+            pass
         await call.answer()
         return
 
@@ -496,32 +535,52 @@ async def handle_ai_motivate(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "change_grade")
 async def handle_change_grade(call: CallbackQuery, state: FSMContext):
     await state.set_state(SetupGrade.grade_number)
-    await call.message.edit_text(
-        "Ընտրեք նոր դասարանը (1-9):",
-        reply_markup=get_grade_numbers_kb()
-    )
+    try:
+        await call.message.edit_text(
+            "Ընտրեք նոր դասարանը (1-9):",
+            reply_markup=get_grade_numbers_kb()
+        )
+    except TelegramBadRequest:
+        pass
     await call.answer()
 
 
-# --- Веб-сервер для поддержки активности Render (Health check) ---
+# --- Health check сервер и Graceful Shutdown ---
 async def handle_health_check(request):
-    return web.Response(text="Bot is operational")
+    return web.Response(text="Bot is operational", status=200)
 
-async def start_web_server():
+async def main():
+    if not TOKEN:
+        logger.critical("BOT_TOKEN is not configured! Exiting.")
+        sys.exit(1)
+
+    await init_db()
+
+    # 1. Запуск Web-сервера для Render
     app = web.Application()
     app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_health_check)
+    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    logger.info(f"Health check HTTP server started on port {PORT}")
 
-async def main():
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN չի գտնվել:")
+    # 2. Очистка вебхука и накопленных апдейтов (предотвращает конфликт 409)
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Pending updates dropped. Starting polling...")
 
-    await init_db()
-    await start_web_server()
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        logger.info("Shutting down bot session and server...")
+        await bot.session.close()
+        await runner.cleanup()
+        logger.info("Shutdown completed cleanly.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user or system.")
